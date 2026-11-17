@@ -49,7 +49,7 @@ encryptKernel(const uint8_t *__restrict__ in, // device, plaintext.size() bytes
   __syncthreads();
 
   // moesten de laatste skippen vgm?
-  for (size_t r = 0; r < rounds - 1; r++) {
+  for (size_t r = 0; r < rounds; r++) {
     const uint8_t *roundkey = keys + r * 512;
     uint8_t xo = R[i] ^ roundkey[i];
     // sb[r ^ rk] != sb[r] ^ sb[rk], betere random
@@ -103,7 +103,7 @@ std::vector<uint8_t> encrypt_cuda(std::vector<uint8_t> plaintext,
   cudaMalloc(&din, plaintext.size() * sizeof(uint8_t));
   cudaMalloc(&dout, plaintext.size() * sizeof(uint8_t));
   // 512 per key
-  cudaMalloc(&dkeys, roundkeys.size() * 512);
+  cudaMalloc(&dkeys, flatkeys.size() * sizeof(uint8_t) * 512);
   cudaMalloc(&dsbox, 256 * sizeof(uint8_t));
   cudaMalloc(&dperm, 512 * sizeof(uint16_t));
 
@@ -137,37 +137,3 @@ std::vector<uint8_t> encrypt_cuda(std::vector<uint8_t> plaintext,
 
   return output;
 }
-
-/*
-validate: plaintext.size() % 1024 == 0, all roundkeys have size 512
-rounds = roundkeys.size()
-
-# 1. flatten keys, reversing order for decryption
-flatKeys = array of rounds * 512 bytes
-for r in 0 ... rounds-1:
-    src = decrypt ? rounds-1-r : r
-    copy roundkeys[src] into flatKeys[r * 512]
-
-# 2. allocate device buffers
-d_in, d_out : plaintext.size() bytes each
-d_keys      : rounds * 512 bytes
-d_sbox      : 256 bytes
-d_perm      : 512 bytes
-
-# 3. copy host -> device
-plaintext -> d_in
-flatKeys  -> d_keys
-substitutionTable -> d_sbox
-permutationTable  -> d_perm
-
-# 4. launch
-numParts = plaintext.size() / 1024
-encryptKernel<<<numParts, 512, smemBytes>>>(d_in, d_out, d_keys, d_sbox,
-d_perm, rounds) check cudaGetLastError(), then cudaDeviceSynchronize() (or the
-memcpy below syncs)
-
-# 5. copy device -> host
-d_out -> output (vector<uint8_t> of plaintext.size())
-
-# 6. cudaFree everything, return output
-*/
