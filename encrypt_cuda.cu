@@ -1,0 +1,142 @@
+
+#include <cstdint>
+#include <cstdio>
+#include <cstdlib>
+#include <vector>
+#include "parameters.h"
+
+/* swaps */
+__device__ void
+runF(const uint8_t *right,   // shared, 512 bytes (current right half)
+     const uint8_t *rk,      // global, 512 bytes (this round's key)
+     uint8_t *out,           // shared, 512 bytes (output)
+     const uint8_t *s_sbox,  // shared, 256 bytes
+     const uint16_t *perm) { // global, 512 entries
+  size_t i = threadIdx.x;
+  size_t randIndex = perm[i];
+  uint8_t xo = right[i] ^ rk[i];
+  // sb[r ^ rk] != sb[r] ^ sb[rk], betere random encryptie denk ik?
+  uint8_t tmp = s_sbox[xo];
+  out[randIndex] = tmp;
+  __syncthreads();
+}
+
+__global__ void
+encryptKernel(const uint8_t *__restrict__ in, // device, plaintext.size() bytes
+              uint8_t *__restrict__ out,      // device, plaintext.size() bytes
+              const uint8_t *__restrict__ keys,  // device, rounds * 512 bytes
+              const uint8_t *__restrict__ sbox,  // device, 256 bytes
+              const uint16_t *__restrict__ perm, // device, 512 entries
+              int rounds) {
+  __shared__ uint8_t s[3 * 512 + 256];
+  uint8_t *bufA = &s[0];
+  uint8_t *bufB = &s[512];
+  uint8_t *scratch = &s[1024];
+  uint8_t *sbx = &s[1536];
+
+  // prep
+  uint8_t *L = bufA;
+  uint8_t *R = bufB;
+  size_t part = blockIdx.x;
+  size_t i = threadIdx.x;
+  size_t randIndex = perm[i];
+
+  for (size_t j = i; j < 256; j += blockDim.x) {
+    sbx[j] = sbox[j];
+  }
+  __syncthreads();
+
+  // moesten de laatste skippen vgm?
+  for (size_t r = 0; r < rounds - 1; r++) {
+    const uint8_t *roundkey = keys + r * 512;
+    uint8_t xo = R[i] ^ roundkey[i];
+    // sb[r ^ rk] != sb[r] ^ sb[rk], betere random
+    uint8_t tmp = sbx[xo];
+    scratch[randIndex] = tmp;
+    // sync writing
+    __syncthreads();
+
+    L[i] ^= scratch[i];
+    // finished mixing in scratch
+    __syncthreads();
+    if (r != rounds - 1) {
+      uint8_t *t = L;
+      L = R;
+      R = t;
+    }
+  }
+  out[part * 1024 + i] = L[i];
+  out[part * 1024 + 512 + i] = R[i];
+
+}
+
+std::vector<uint8_t> encrypt_cuda(std::vector<uint8_t> &plaintext,
+                                  std::vector<std::vector<uint8_t>> &roundkeys,
+                                  bool decrypt = false) {
+
+  auto output = std::vector<uint8_t>(plaintext.size());
+
+  size_t startKey = decrypt ? 0 : roundkeys.size()-1;
+  size_t stopKey = decrypt ?  roundkeys.size()-1 : 0;
+
+  size_t keysnum = roundkeys.size();
+  size_t keysize = roundkeys[0].size();
+  for (auto k : roundkeys) {
+    if (k.size() != keysize) {
+      printf("Keys don't have matching length");
+      exit(1);
+    }
+  }
+
+  std::vector<uint8_t> flatkeys(keysnum * keysize);
+  for (size_t r = 0; r < keysnum; r++) {
+    // reverse order als decrypt
+    size_t src = decrypt ? keysnum - 1 - r : r;
+    std::copy(roundkeys[src].begin(), roundkeys[src].end(),
+              flatkeys.begin() + r * keysize);
+  }
+
+  uint8_t *din, *dout, *dkeys, *dsbox, *dperm;
+  // ja duh, das waar ge alles in/uit leest
+  cudaMalloc(&din, plaintext.size() * sizeof(uint8_t));
+  cudaMalloc(&dout, plaintext.size() * sizeof(uint8_t));
+  // 512 per key
+  cudaMalloc(&dkeys, roundkeys.size() * 512);
+  cudaMalloc(&dsbox, 256 * sizeof(uint8_t));
+  cudaMalloc(&dperm, 512 * sizeof(uint8_t));
+
+  /*
+  validate: plaintext.size() % 1024 == 0, all roundkeys have size 512
+  rounds = roundkeys.size()
+
+  # 1. flatten keys, reversing order for decryption
+  flatKeys = array of rounds * 512 bytes
+  for r in 0 ... rounds-1:
+      src = decrypt ? rounds-1-r : r
+      copy roundkeys[src] into flatKeys[r * 512]
+
+  # 2. allocate device buffers
+  d_in, d_out : plaintext.size() bytes each
+  d_keys      : rounds * 512 bytes
+  d_sbox      : 256 bytes
+  d_perm      : 512 bytes
+
+  # 3. copy host -> device
+  plaintext -> d_in
+  flatKeys  -> d_keys
+  substitutionTable -> d_sbox
+  permutationTable  -> d_perm
+
+  # 4. launch
+  numParts = plaintext.size() / 1024
+  encryptKernel<<<numParts, 512, smemBytes>>>(d_in, d_out, d_keys, d_sbox,
+  d_perm, rounds) check cudaGetLastError(), then cudaDeviceSynchronize() (or the
+  memcpy below syncs)
+
+  # 5. copy device -> host
+  d_out -> output (vector<uint8_t> of plaintext.size())
+
+  # 6. cudaFree everything, return output
+  */
+  return output;
+}
